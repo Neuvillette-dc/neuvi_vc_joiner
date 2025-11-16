@@ -38,7 +38,7 @@ const defaultConfig = {
   chatter: {
     tokens: [],
     channelId: null,
-    messageDelaySec: 10,
+    messageDelayMs: 10000,
     messages: [],
     dispatchMode: 'random',
     assignments: [],
@@ -82,6 +82,37 @@ function emitLines(lines) {
   payload.filter(Boolean).forEach(text => logger.confirm(String(text)));
 }
 
+function captureConsole(level, args) {
+  if (!args || !args.length) return;
+  const message = args
+    .map(arg => (typeof arg === 'string' ? arg : (() => {
+      try {
+        return JSON.stringify(arg);
+      } catch (_err) {
+        return String(arg);
+      }
+    })()))
+    .join(' ');
+  appendLog(level, message);
+}
+
+console.log = (...args) => captureConsole('CONSOLE', args);
+console.info = (...args) => captureConsole('INFO', args);
+console.warn = (...args) => captureConsole('WARN', args);
+console.error = (...args) => captureConsole('ERROR', args);
+
+process.on('uncaughtException', err => {
+  appendLog('UNCAUGHT_EXCEPTION', 'Unhandled exception in process', err);
+});
+
+process.on('unhandledRejection', reason => {
+  let error = reason;
+  if (!(error instanceof Error)) {
+    error = new Error(typeof reason === 'string' ? reason : String(reason));
+  }
+  appendLog('UNHANDLED_REJECTION', 'Unhandled promise rejection in process', error);
+});
+
 const BORDER_DOUBLE = {
   topLeft: '╔',
   topRight: '╗',
@@ -113,6 +144,51 @@ function centerText(text, width) {
   const left = Math.floor(totalPadding / 2);
   const right = totalPadding - left;
   return `${repeatChar(' ', left)}${target}${repeatChar(' ', right)}`;
+}
+
+const COLORS = {
+  reset: '\u001b[0m',
+  blue: '\u001b[38;5;39m',
+  cyan: '\u001b[36m',
+  brightCyan: '\u001b[96m',
+  magenta: '\u001b[35m',
+  yellow: '\u001b[33m',
+  white: '\u001b[37m',
+  brightWhite: '\u001b[97m',
+  red: '\u001b[31m',
+};
+
+function wrapColor(text, color) {
+  if (!color) return text;
+  return `${color}${text}${COLORS.reset}`;
+}
+
+function pickAccentColor() {
+  const accents = [COLORS.cyan, COLORS.magenta, COLORS.yellow, COLORS.brightWhite];
+  return accents[Math.floor(Math.random() * accents.length)];
+}
+
+function colorizeMenuLines(lines, { isExitBlock = false } = {}) {
+  return lines.map(line => {
+    if (!line || !line.trim()) return line;
+
+    const hasDoubleBorder = /[╔╗╚╝═]/.test(line);
+    const hasSingleBorder = /[┌┐└┘─]/.test(line);
+    const isExit = isExitBlock || line.includes('[0]');
+
+    let color;
+    if (isExit) {
+      color = COLORS.red;
+    } else if (hasDoubleBorder) {
+      color = COLORS.blue;
+    } else if (hasSingleBorder) {
+      color = COLORS.cyan;
+    } else {
+      color = pickAccentColor();
+    }
+
+    return wrapColor(line, color);
+  });
 }
 
 function buildColumnMatrix(options, columns) {
@@ -267,8 +343,13 @@ function renderAdaptiveMenu({
     ? `${repeatChar(' ', terminalWidth - cornerLabel.length)}${cornerLabel}`
     : cornerLabel.slice(0, terminalWidth);
 
+  const coloredHeaderTitle = wrapColor(headerTitle, COLORS.red);
+  const coloredCornerLine = wrapColor(cornerLine, COLORS.brightCyan);
+  const coloredMenu = colorizeMenuLines(finalLines);
+  const coloredExit = colorizeMenuLines(exitLines, { isExitBlock: true });
+
   process.stdout.write('\u001Bc');
-  process.stdout.write(`${headerTitle}\n${cornerLine}\n${finalLines.join('\n')}\n\n${exitLines.join('\n')}\n`);
+  process.stdout.write(`${coloredHeaderTitle}\n${coloredCornerLine}\n${coloredMenu.join('\n')}\n\n${coloredExit.join('\n')}\n`);
 }
 
 const state = {
@@ -348,16 +429,24 @@ function sanitizeChatterConfig(raw = {}) {
     if (!channelId) channelId = null;
   }
 
-  let delay = Number(raw.messageDelaySec);
-  if (!Number.isFinite(delay) || delay < 0) {
+  // Normalize delay to milliseconds. Prefer messageDelayMs; fall back to historic
+  // fields (interval in ms or messageDelaySec in seconds) for backward compatibility.
+  let delayMs = Number(raw.messageDelayMs);
+  if (!Number.isFinite(delayMs) || delayMs < 0) {
     const interval = Number(raw.interval);
     if (Number.isFinite(interval) && interval >= 0) {
-      delay = Math.max(0, Math.round(interval / 1000));
+      // interval was historically used as ms
+      delayMs = Math.max(0, Math.round(interval));
     } else {
-      delay = defaultConfig.chatter.messageDelaySec;
+      const legacySec = Number(raw.messageDelaySec);
+      if (Number.isFinite(legacySec) && legacySec >= 0) {
+        delayMs = Math.max(0, Math.round(legacySec * 1000));
+      } else {
+        delayMs = defaultConfig.chatter.messageDelayMs;
+      }
     }
   } else {
-    delay = Math.max(0, Math.round(delay));
+    delayMs = Math.max(0, Math.round(delayMs));
   }
 
   const rawMessages = Array.isArray(raw.messages)
@@ -435,7 +524,7 @@ function sanitizeChatterConfig(raw = {}) {
   return {
     tokens,
     channelId: channelId || null,
-    messageDelaySec: delay,
+    messageDelayMs: delayMs,
     messages: normalized,
     dispatchMode:
       typeof raw.dispatchMode === 'string'
@@ -679,7 +768,7 @@ class VoiceConnector {
         this._joinVoice(session);
       } else {
         session.client.login(token).catch(err => {
-          console.error(`Login failed for voice token ${formatToken(token)}: ${err.message}`);
+          logger.error(`Login failed for voice token ${formatToken(token)}`, err);
         });
       }
     });
@@ -752,7 +841,9 @@ class VoiceConnector {
 }
 
 class ChatterManager {
-  constructor() {
+  constructor(sessionManager, onlineManager) {
+    this.sessionManager = sessionManager;
+    this.onlineManager = onlineManager;
     this.config = null;
     this.sessions = [];
     this.timer = null;
@@ -775,7 +866,7 @@ class ChatterManager {
       this.config.channelId &&
       Array.isArray(this.config.messages) &&
       this.config.messages.length > 0 &&
-      Number.isFinite(Number(this.config.messageDelaySec))
+      Number.isFinite(Number(this.config.messageDelayMs))
     );
   }
 
@@ -787,43 +878,57 @@ class ChatterManager {
 
     this.stop();
     logger.confirm('Chatter starting...');
-    const { tokens, channelId, messageDelaySec, messages, dispatchMode, assignments = [] } = this.config;
-    const intervalMs = Math.max(0, Number(messageDelaySec)) * 1000;
+    const { tokens, channelId, messageDelayMs, messages, dispatchMode, assignments = [] } = this.config;
+    const intervalMs = Math.max(0, Number(messageDelayMs));
     let messageIndex = 0;
     let tokenIndex = 0;
     let assignmentIndex = 0;
     const messageMap = new Map(messages.map(msg => [msg.id, msg]));
 
-    tokens.forEach((token, index) => {
-      const client = new Client();
-      const session = { client, token, ready: false, channel: null };
-      this.sessions.push(session);
+    this.sessions = [];
 
-      client.once('ready', async () => {
+    tokens.forEach((token, index) => {
+      let baseSession = this.sessionManager.get(token);
+      if (!baseSession) {
+        baseSession = this.sessionManager.create(token);
+        this.onlineManager._wireSession(baseSession, 0);
+      }
+
+      const wrapper = { token, session: baseSession, channel: null, ready: false };
+      this.sessions.push(wrapper);
+
+      const { client } = baseSession;
+
+      const onReady = async () => {
         logger.info(`[Chatter ${index + 1}] Logged in as ${client.user.tag}`);
         try {
-          session.channel = await client.channels.fetch(channelId);
-          session.ready = true;
+          wrapper.channel = await client.channels.fetch(channelId);
+          wrapper.ready = true;
           logger.info(`[Chatter ${index + 1}] Ready to send messages.`);
         } catch (err) {
           logger.error(`[Chatter ${index + 1}] Channel fetch failed`, err);
         }
-      });
+      };
+
+      if (baseSession.ready && client?.ws?.status === 0) {
+        onReady();
+      } else {
+        client.once('ready', onReady);
+      }
 
       client.on('error', err => {
         logger.error(`[Chatter ${index + 1}] Client error`, err);
       });
-
-      client.login(token).catch(err => {
-        logger.error(`[Chatter ${index + 1}] Login failed`, err);
-      });
     });
 
+    // Ensure chatter tokens are online and in DND using the shared online manager
+    this.onlineManager.start(tokens);
+
     const tick = async () => {
-      const readySessions = this.sessions.filter(session => session.ready && session.channel);
+      const readySessions = this.sessions.filter(entry => entry.ready && entry.channel);
       if (!readySessions.length) return;
 
-      let session;
+      let target;
       let message;
 
       const activeAssignments = assignments
@@ -837,19 +942,19 @@ class ChatterManager {
         const current = activeAssignments[assignmentIndex % activeAssignments.length];
         assignmentIndex = (assignmentIndex + 1) % activeAssignments.length;
         message = messageMap.get(current.messageId);
-        session = readySessions.find(s => s.token === current.token);
-        if (!session || !message) return;
+        target = readySessions.find(s => s.token === current.token);
+        if (!target || !message) return;
       } else if (activeAssignments.length) {
         const current = activeAssignments[assignmentIndex % activeAssignments.length];
         assignmentIndex = (assignmentIndex + 1) % activeAssignments.length;
         message = messageMap.get(current.messageId);
-        session = readySessions.find(s => s.token === current.token);
-        if (!session || !message) return;
+        target = readySessions.find(s => s.token === current.token);
+        if (!target || !message) return;
       } else if (dispatchMode === 'random') {
-        session = readySessions[Math.floor(Math.random() * readySessions.length)];
+        target = readySessions[Math.floor(Math.random() * readySessions.length)];
         message = messages[Math.floor(Math.random() * messages.length)];
       } else {
-        session = readySessions[tokenIndex % readySessions.length];
+        target = readySessions[tokenIndex % readySessions.length];
         message = messages[messageIndex % messages.length];
         tokenIndex = (tokenIndex + 1) % readySessions.length;
         if (tokenIndex === 0) {
@@ -860,13 +965,17 @@ class ChatterManager {
       if (!message || !message.text) return;
 
       try {
-        await session.channel.send(message.text);
+        await target.channel.send(message.text);
         logger.info(
-          `[Chatter] Sent message ${message.id} using ${session.client.user?.tag || formatToken(session.token)}`,
+          `[Chatter] Sent message ${message.id} using ${
+            target.session.client?.user?.tag || formatToken(target.token)
+          }`,
         );
       } catch (err) {
         logger.error(
-          `[Chatter] Send error for ${session.client.user?.tag || formatToken(session.token)}`,
+          `[Chatter] Send error for ${
+            target.session.client?.user?.tag || formatToken(target.token)
+          }`,
           err,
         );
       }
@@ -875,17 +984,17 @@ class ChatterManager {
     const effectiveInterval = intervalMs === 0 ? 500 : intervalMs;
     this.timer = setInterval(tick, effectiveInterval || 500);
 
+    // Kick off an early tick so the first message doesn't wait a full delay
+    setTimeout(tick, Math.min(1000, effectiveInterval || 500));
+
     this.active = true;
   }
 
   stop() {
-    this.sessions.forEach(({ client }) => {
-      try {
-        client.destroy();
-      } catch (err) {
-        // ignore
-      }
-    });
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
     this.sessions = [];
     const wasActive = this.active;
     this.active = false;
@@ -898,11 +1007,11 @@ class ChatterManager {
 const sessionManager = new SessionManager();
 const onlineManager = new OnlinePresenceManager(sessionManager);
 const voiceConnector = new VoiceConnector(sessionManager);
-const chatterManager = new ChatterManager();
+const chatterManager = new ChatterManager(sessionManager, onlineManager);
 
 async function handleLoginOnline() {
   if (!state.tokens.length) {
-    console.log('No tokens loaded. Use option 2 to manage tokens first.');
+    logger.confirm('No tokens loaded. Use option 2 to manage tokens first.');
     await pause();
     return;
   }
@@ -919,12 +1028,12 @@ async function handleManageTokens() {
   TokenManager.save(state.tokens);
 
   if (!state.tokens.length) {
-    console.log('No valid tokens found.');
+    logger.confirm('No valid tokens found.');
   } else {
-    console.log('Current valid tokens:');
-    state.tokens.forEach((token, index) => {
-      console.log(`${index + 1}: ${formatToken(token)}`);
-    });
+    emitLines([
+      'Current valid tokens:',
+      ...state.tokens.map((token, index) => `${index + 1}: ${formatToken(token)}`),
+    ]);
   }
 
   const addMore = (await ask('Add more tokens? (y/n): ')).trim().toLowerCase();
@@ -941,7 +1050,7 @@ async function handleManageTokens() {
       if (newValid.length) {
         state.tokens = Array.from(new Set([...state.tokens, ...newValid]));
         TokenManager.save(state.tokens);
-        console.log('New tokens added.');
+        logger.confirm('New tokens added.');
       }
     }
   }
@@ -953,9 +1062,9 @@ async function handleManageTokens() {
       if (indexes.length) {
         indexes.forEach(index => state.tokens.splice(index, 1));
         TokenManager.save(state.tokens);
-        console.log('Tokens removed.');
+        logger.confirm('Tokens removed.');
       } else {
-        console.log('No valid selection made.');
+        logger.confirm('No valid selection made.');
       }
     }
   }
@@ -976,12 +1085,12 @@ async function handleGuildAndVc() {
   }
 
   saveConfig();
-  console.log(`Guild ID: ${state.config.guildId || 'not set'}, VC ID: ${state.config.vcId || 'not set'}`);
+  logger.confirm(`Guild ID: ${state.config.guildId || 'not set'}, VC ID: ${state.config.vcId || 'not set'}`);
 }
 
 async function handleJoinServer() {
   if (!state.tokens.length) {
-    console.log('No tokens available. Use option 2 to manage tokens first.');
+    logger.confirm('No tokens available. Use option 2 to manage tokens first.');
     await pause();
     return;
   }
@@ -990,7 +1099,7 @@ async function handleJoinServer() {
   const code = inviteLink.split('/').pop()?.split('?')[0];
 
   if (!code) {
-    console.log('Invalid invite link.');
+    logger.confirm('Invalid invite link.');
     await pause();
     return;
   }
@@ -1016,7 +1125,7 @@ async function handleJoinServer() {
       if (status === 400 && data?.captcha_key && solver) {
         // Attempt to solve captcha
         try {
-          console.log(`Solving captcha for token ${i + 1}...`);
+          logger.confirm(`Solving captcha for token ${i + 1}...`);
           const result = await solver.hcaptcha(data.captcha_sitekey, 'https://discord.com', {
             rqdata: data.captcha_rqdata,
           });
@@ -1031,20 +1140,20 @@ async function handleJoinServer() {
             headers: { Authorization: token },
           });
           successCount += 1;
-          console.log(`Token ${i + 1} joined after solving captcha.`);
+          logger.confirm(`Token ${i + 1} joined after solving captcha.`);
         } catch (captchaErr) {
           failureCount += 1;
-          console.error(`Token ${i + 1} captcha solve failed: ${captchaErr.message}`);
+          logger.error(`Token ${i + 1} captcha solve failed`, captchaErr);
         }
       } else {
         failureCount += 1;
         const detail = status ? `${status} ${JSON.stringify(data)}` : err.message;
-        console.error(`Token ${i + 1} failed: ${detail}`);
+        logger.error(`Token ${i + 1} failed: ${detail}`);
       }
     }
   }
 
-  console.log(`Join summary: ${successCount} succeeded, ${failureCount} failed.`);
+  logger.confirm(`Join summary: ${successCount} succeeded, ${failureCount} failed.`);
   await pause();
 }
 
@@ -1059,7 +1168,7 @@ async function showChatterMenu() {
     const metaLines = [
       `Tokens: ${config.tokens.length || 0}`,
       `Channel ID: ${config.channelId || 'not set'}`,
-      `Delay: ${config.messageDelaySec}s`,
+      `Delay: ${config.messageDelayMs}ms`,
       `Messages: ${config.messages.length}`,
       `Assignments: ${config.assignments.length}`,
       `Dispatch Mode: ${config.dispatchMode}`,
@@ -1071,7 +1180,7 @@ async function showChatterMenu() {
       options: [
         { key: '1', label: 'Manage tokens' },
         { key: '2', label: 'Check tokens in guild' },
-        { key: '3', label: 'Set message delay (seconds)' },
+        { key: '3', label: 'Set message delay (milliseconds)' },
         { key: '4', label: 'Dispatch mode (Random / Order / Assigned)' },
         { key: '5', label: 'Messages config' },
         { key: '6', label: 'Token-message assignments' },
@@ -1244,14 +1353,14 @@ async function handleSetChatterChannel() {
 async function checkChatterTokensInGuild() {
   const tokens = state.config.chatter.tokens;
   if (!tokens.length) {
-    console.log('No chatter tokens configured.');
+    logger.confirm('No chatter tokens configured.');
     await pause();
     return;
   }
 
   const guildId = (await ask('Enter Guild ID to check: ')).trim();
   if (!guildId) {
-    console.log('Guild ID is required.');
+    logger.confirm('Guild ID is required.');
     await pause();
     return;
   }
@@ -1274,38 +1383,38 @@ async function checkChatterTokensInGuild() {
   }
 
   if (present.length) {
-    console.log('Tokens that ARE in the guild:');
-    present.forEach(entry => {
-      console.log(`[${entry.index + 1}] ${formatToken(entry.token)}`);
-    });
+    emitLines([
+      'Tokens that ARE in the guild:',
+      ...present.map(entry => `[${entry.index + 1}] ${formatToken(entry.token)}`),
+    ]);
   } else {
-    console.log('No chatter tokens are currently in the guild.');
+    logger.confirm('No chatter tokens are currently in the guild.');
   }
 
   if (missing.length) {
-    console.log('Tokens NOT in the guild:');
-    missing.forEach(entry => {
-      console.log(`[${entry.index + 1}] ${formatToken(entry.token)} -> ${entry.detail}`);
-    });
+    emitLines([
+      'Tokens NOT in the guild:',
+      ...missing.map(entry => `[${entry.index + 1}] ${formatToken(entry.token)} -> ${entry.detail}`),
+    ]);
   }
 
   await pause();
 }
 
 async function configureChatterDelay() {
-  const current = state.config.chatter.messageDelaySec;
-  const input = await ask(`Enter message delay in seconds (current: ${current}): `);
+  const current = state.config.chatter.messageDelayMs;
+  const input = await ask(`Enter message delay in milliseconds (current: ${current}): `);
   const value = Number(input);
   if (!Number.isFinite(value) || value < 0) {
-    console.log('Invalid delay. Please enter a number >= 0.');
+    logger.confirm('Invalid delay. Please enter a number >= 0.');
     await pause();
     return;
   }
 
   applyChatterConfigUpdate(config => {
-    config.messageDelaySec = Math.max(0, Math.round(value));
+    config.messageDelayMs = Math.max(0, Math.round(value));
   });
-  console.log(`Message delay set to ${state.config.chatter.messageDelaySec}s.`);
+  logger.confirm(`Message delay set to ${state.config.chatter.messageDelayMs}ms.`);
   await pause();
 }
 
@@ -1350,7 +1459,9 @@ async function toggleChatterRandomMode() {
   applyChatterConfigUpdate(config => {
     config.randomize = !current;
   });
-  console.log(`Random mode is now ${state.config.chatter.randomize ? 'enabled (random token/message)' : 'disabled (rotating order)'}.`);
+  logger.confirm(
+    `Random mode is now ${state.config.chatter.randomize ? 'enabled (random token/message)' : 'disabled (rotating order)'}.`,
+  );
   await pause();
 }
 
@@ -1358,22 +1469,24 @@ async function manageChatterAssignments() {
   const tokens = state.config.chatter.tokens;
   const messages = state.config.chatter.messages;
   if (!tokens.length || !messages.length) {
-    console.log('Assignments require tokens and messages. Add those first.');
+    logger.confirm('Assignments require tokens and messages. Add those first.');
     await pause();
     return;
   }
 
-  console.log('Chatter tokens:');
-  tokens.forEach((token, index) => {
-    console.log(`${index + 1}: ${formatToken(token)}`);
-  });
+  emitLines([
+    'Chatter tokens:',
+    ...tokens.map((token, index) => `${index + 1}: ${formatToken(token)}`),
+  ]);
   printChatterAssignments();
   printChatterMessages();
 
-  console.log('Enter assignments as "<token> <messageId>".');
-  console.log('Use the same token+message to remove an existing mapping.');
-  console.log('Use the same token with a different message ID to update the mapping.');
-  console.log('Type 0 to finish.');
+  emitLines([
+    'Enter assignments as "<token> <messageId>".',
+    'Use the same token+message to remove an existing mapping.',
+    'Use the same token with a different message ID to update the mapping.',
+    'Type 0 to finish.',
+  ]);
 
   const messageMap = new Map(messages.map(msg => [msg.id, msg]));
 
@@ -1386,7 +1499,7 @@ async function manageChatterAssignments() {
 
     const parts = trimmed.split(/\s+/);
     if (parts.length < 2) {
-      console.log('Provide token and message ID separated by space.');
+      logger.confirm('Provide token and message ID separated by space.');
       continue;
     }
 
@@ -1402,13 +1515,13 @@ async function manageChatterAssignments() {
     }
 
     if (!tokens.includes(tokenValue)) {
-      console.log('Token not part of chatter tokens. Use index or full token.');
+      logger.confirm('Token not part of chatter tokens. Use index or full token.');
       continue;
     }
 
     const messageId = Number.parseInt(messageIdInput, 10);
     if (!Number.isInteger(messageId) || !messageMap.has(messageId)) {
-      console.log('Message ID not found.');
+      logger.confirm('Message ID not found.');
       continue;
     }
 
@@ -1418,7 +1531,7 @@ async function manageChatterAssignments() {
     const messageAlreadyTaken = currentAssignments.find(item => item.messageId === messageId && item.token !== tokenValue);
 
     if (messageAlreadyTaken) {
-      console.log(`Message ${messageId} already assigned to another token. Remove that first.`);
+      logger.confirm(`Message ${messageId} already assigned to another token. Remove that first.`);
       continue;
     }
 
@@ -1426,14 +1539,14 @@ async function manageChatterAssignments() {
       applyChatterConfigUpdate(config => {
         config.assignments = config.assignments.filter(item => !(item.token === tokenValue && item.messageId === messageId));
       });
-      console.log('Assignment removed.');
+      logger.confirm('Assignment removed.');
     } else {
       applyChatterConfigUpdate(config => {
         const filtered = config.assignments.filter(item => item.token !== tokenValue);
         config.assignments = filtered;
         config.assignments.push({ token: tokenValue, messageId });
       });
-      console.log(`Assignment set: ${formatToken(tokenValue)} -> message ${messageId}.`);
+      logger.confirm(`Assignment set: ${formatToken(tokenValue)} -> message ${messageId}.`);
     }
 
     printChatterAssignments();
@@ -1445,13 +1558,21 @@ async function manageChatterAssignments() {
 async function showMessageConfigMenu() {
   let exit = false;
   while (!exit) {
-    console.log('\nChatter Messages Menu:');
-    console.log('1: List messages');
-    console.log('2: Remove message');
-    console.log('3: Add message');
-    console.log('0: Back');
+    const messages = state.config.chatter.messages || [];
 
-    const choice = await ask('Select option: ');
+    renderAdaptiveMenu({
+      title: 'Chatter Messages Menu',
+      metaLines: [`Messages: ${messages.length}`],
+      options: [
+        { key: '1', label: 'List messages' },
+        { key: '2', label: 'Remove message' },
+        { key: '3', label: 'Add message' },
+      ],
+      columns: 1,
+      exitLabel: '[0] BACK',
+    });
+
+    const choice = (await ask('Select option: ')).trim();
     switch (choice) {
       case '1':
         await listChatterMessages();
@@ -1466,7 +1587,8 @@ async function showMessageConfigMenu() {
         exit = true;
         break;
       default:
-        console.log('Invalid option.');
+        logger.confirm('Invalid option.');
+        await pause();
     }
   }
 }
@@ -1474,14 +1596,14 @@ async function showMessageConfigMenu() {
 function printChatterMessages() {
   const messages = state.config.chatter.messages;
   if (!messages.length) {
-    console.log('No chatter messages configured.');
+    logger.confirm('No chatter messages configured.');
     return false;
   }
 
-  console.log('Chatter messages:');
-  messages.forEach(message => {
-    console.log(`[${message.id}] ${message.text}`);
-  });
+  emitLines([
+    'Chatter messages:',
+    ...messages.map(message => `[${message.id}] ${message.text}`),
+  ]);
   return true;
 }
 
@@ -1493,23 +1615,25 @@ async function listChatterMessages() {
 function printChatterAssignments() {
   const { assignments, messages } = state.config.chatter;
   if (!assignments.length) {
-    console.log('No chatter assignments configured.');
+    logger.confirm('No chatter assignments configured.');
     return false;
   }
 
   const messageMap = new Map(messages.map(message => [message.id, message.text]));
-  console.log('Chatter assignments:');
-  assignments.forEach((assignment, index) => {
-    const text = messageMap.get(assignment.messageId) || '(message missing)';
-    console.log(`${index + 1}: ${formatToken(assignment.token)} -> [${assignment.messageId}] ${text}`);
-  });
+  emitLines([
+    'Chatter assignments:',
+    ...assignments.map((assignment, index) => {
+      const text = messageMap.get(assignment.messageId) || '(message missing)';
+      return `${index + 1}: ${formatToken(assignment.token)} -> [${assignment.messageId}] ${text}`;
+    }),
+  ]);
   return true;
 }
 
 async function removeChatterMessage() {
   const messages = state.config.chatter.messages;
   if (!messages.length) {
-    console.log('No chatter messages to remove.');
+    logger.confirm('No chatter messages to remove.');
     await pause();
     return;
   }
@@ -1517,21 +1641,21 @@ async function removeChatterMessage() {
   printChatterMessages();
   const input = await ask('Enter message ID to remove (0 to cancel): ');
   if (input === '0') {
-    console.log('No messages removed.');
+    logger.confirm('No messages removed.');
     await pause();
     return;
   }
 
   const id = Number.parseInt(input, 10);
   if (!Number.isInteger(id) || id <= 0) {
-    console.log('Invalid message ID.');
+    logger.confirm('Invalid message ID.');
     await pause();
     return;
   }
 
   const exists = messages.some(message => message.id === id);
   if (!exists) {
-    console.log(`Message with ID ${id} not found.`);
+    logger.confirm(`Message with ID ${id} not found.`);
     await pause();
     return;
   }
@@ -1539,7 +1663,7 @@ async function removeChatterMessage() {
   applyChatterConfigUpdate(config => {
     config.messages = config.messages.filter(message => message.id !== id);
   });
-  console.log(`Message ${id} removed.`);
+  logger.confirm(`Message ${id} removed.`);
   await pause();
 }
 
@@ -1547,7 +1671,7 @@ async function addChatterMessage() {
   const input = await ask('Enter new message (leave blank to cancel): ');
   const text = input.trim();
   if (!text) {
-    console.log('No message added.');
+    logger.confirm('No message added.');
     await pause();
     return;
   }
@@ -1558,23 +1682,23 @@ async function addChatterMessage() {
   });
 
   const added = state.config.chatter.messages[state.config.chatter.messages.length - 1];
-  console.log(`Added message [${added.id}]: ${added.text}`);
+  logger.confirm(`Added message [${added.id}]: ${added.text}`);
   await pause();
 }
 
 async function handleToggleChatter() {
   if (!chatterManager.isConfigured()) {
-    console.log('Chatter is not configured. Use option 5 to configure tokens/messages first.');
+    logger.confirm('Chatter is not configured. Use option 5 to configure tokens/messages first.');
     await pause();
     return;
   }
 
   if (chatterManager.isRunning()) {
     chatterManager.stop();
-    console.log('Chatter stopped.');
+    logger.confirm('Chatter stopped.');
   } else {
     chatterManager.start();
-    console.log('Chatter started.');
+    logger.confirm('Chatter started.');
   }
 
   await pause();
@@ -1587,7 +1711,7 @@ async function handleVoiceToggle() {
 
 async function handleLeaveServer() {
   if (!state.tokens.length) {
-    console.log('No tokens available. Use option 2 to manage tokens first.');
+    logger.confirm('No tokens available. Use option 2 to manage tokens first.');
     await pause();
     return;
   }
@@ -1608,18 +1732,18 @@ async function handleLeaveServer() {
       const code = err.response?.status;
       const data = err.response?.data;
       const detail = code ? `${code} ${JSON.stringify(data)}` : err.message;
-      console.error(`Token ${i + 1} failed: ${detail}`);
+      logger.error(`Token ${i + 1} failed: ${detail}`);
     }
   }
 
-  console.log(`Leave summary: ${successCount} succeeded, ${failureCount} failed.`);
+  logger.confirm(`Leave summary: ${successCount} succeeded, ${failureCount} failed.`);
   await pause();
 }
 
 async function handleListTokens() {
   const originalTokens = TokenManager.load();
   if (!originalTokens.length) {
-    console.log('No tokens found.');
+    logger.confirm('No tokens found.');
     await pause();
     return;
   }
@@ -1628,14 +1752,16 @@ async function handleListTokens() {
   state.tokens = valid;
 
   if (!invalid.length && !valid.length) {
-    console.log('No tokens found.');
+    logger.confirm('No tokens found.');
     await pause();
     return;
   }
 
-  console.log('Tokens:');
-  invalid.forEach((token, index) => console.log(`${index + 1}: ${formatToken(token)} (INVALID)`));
-  valid.forEach((token, index) => console.log(`${invalid.length + index + 1}: ${formatToken(token)} (VALID)`));
+  emitLines([
+    'Tokens:',
+    ...invalid.map((token, index) => `${index + 1}: ${formatToken(token)} (INVALID)`),
+    ...valid.map((token, index) => `${invalid.length + index + 1}: ${formatToken(token)} (VALID)`),
+  ]);
 
   if (invalid.length) {
     const remove = await ask('Remove invalid tokens by numbers (comma-separated, 0 to skip): ');
@@ -1646,9 +1772,9 @@ async function handleListTokens() {
         const updatedTokens = [...remainingInvalid, ...valid];
         TokenManager.save(updatedTokens);
         state.tokens = valid;
-        console.log('Invalid tokens removed.');
+        logger.confirm('Invalid tokens removed.');
       } else {
-        console.log('No invalid tokens removed.');
+        logger.confirm('No invalid tokens removed.');
       }
     } else {
       TokenManager.save([...invalid, ...valid]);
@@ -1657,7 +1783,7 @@ async function handleListTokens() {
   } else {
     TokenManager.save(valid);
     state.tokens = valid;
-    console.log('No invalid tokens found.');
+    logger.confirm('No invalid tokens found.');
   }
 
   await pause();
@@ -1719,7 +1845,7 @@ async function mainMenu() {
 }
 
 process.on('SIGINT', () => {
-  console.log('\nReceived SIGINT. Cleaning up...');
+  logger.confirm('Received SIGINT. Cleaning up...');
   rl.close();
   voiceConnector.stop();
   chatterManager.stop();
