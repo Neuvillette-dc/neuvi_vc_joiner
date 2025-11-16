@@ -1309,6 +1309,42 @@ async function configureChatterDelay() {
   await pause();
 }
 
+async function configureChatterDispatchMode() {
+  const current = state.config.chatter.dispatchMode || 'random';
+  const choices = [
+    { key: '1', mode: 'random', label: 'Random (random token + random message)' },
+    { key: '2', mode: 'sequential', label: 'Order (rotate tokens/messages)' },
+    { key: '3', mode: 'assigned', label: 'Assigned only (use token-message mappings)' },
+  ];
+
+  renderAdaptiveMenu({
+    title: 'Chatter Dispatch Mode',
+    metaLines: [`Current mode: ${current}`],
+    options: choices.map(item => ({ key: item.key, label: item.label })),
+    columns: 1,
+    exitLabel: '[0] BACK',
+  });
+
+  const choice = (await ask('Select mode: ')).trim();
+  if (choice === '0') {
+    return;
+  }
+
+  const selected = choices.find(item => item.key === choice);
+  if (!selected) {
+    logger.confirm('Invalid mode selected.');
+    await pause();
+    return;
+  }
+
+  applyChatterConfigUpdate(config => {
+    config.dispatchMode = selected.mode;
+  });
+
+  logger.confirm(`Chatter dispatch mode set to: ${selected.mode}.`);
+  await pause();
+}
+
 async function toggleChatterRandomMode() {
   const current = state.config.chatter.randomize;
   applyChatterConfigUpdate(config => {
